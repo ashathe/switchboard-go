@@ -146,6 +146,22 @@ func (r *ProviderRouter) NumProviders() int {
 	return len(r.providers)
 }
 
+// singleKeyStatus builds a minimal StatusResponse for an OAuth provider's
+// single "key" so SMTP notifications can use the same format.
+func (r *ProviderRouter) singleKeyStatus(name, state string) StatusResponse {
+	return StatusResponse{
+		CurrentKeyIndex: 0,
+		Keys: []PerKeyStatus{{
+			Index:    0,
+			State:    state,
+			Current:  true,
+			Eligible: state == "available",
+		}},
+		RetryExhaustedAfterSeconds: 0,
+		Note:                       "oauth provider " + name,
+	}
+}
+
 // ProviderStatus shows one provider's key pool status.
 type ProviderStatus struct {
 	Name    string          `json:"name"`

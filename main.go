@@ -705,6 +705,13 @@ func (a *App) handleResetKey(w http.ResponseWriter, r *http.Request) {
 	if a.router != nil && body.Provider != "" {
 		for _, prov := range a.router.providers {
 			if prov.Config.Name == body.Provider {
+				if prov.IsOAuth() {
+					// OAuth providers have a single "key" — reset the exhausted flag.
+					prov.OAuth.Reset()
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(a.router.MultiStatus())
+					return
+				}
 				if body.Index < 0 || body.Index >= len(prov.Config.APIKeys) {
 					http.Error(w, "index out of range", http.StatusBadRequest)
 					return
@@ -731,6 +738,10 @@ func (a *App) handleResetKey(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleResetAllKeys(w http.ResponseWriter, r *http.Request) {
 	if a.router != nil {
 		for _, prov := range a.router.providers {
+			if prov.IsOAuth() {
+				prov.OAuth.Reset()
+				continue
+			}
 			for i := range prov.Config.APIKeys {
 				a.router.MarkAvailable(prov, i)
 			}
@@ -753,15 +764,25 @@ func (a *App) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.router != nil {
-		prov, _, key, ok := a.router.Current()
+		prov, _, _, ok := a.router.Current()
 		if !ok {
 			writeJSON(w, http.StatusServiceUnavailable, resp)
 			return
 		}
-		if err := a.checkUpstreamReady(r.Context(), prov.Config.BaseURL, key); err != nil {
-			resp["error"] = "upstream not ready"
-			writeJSON(w, http.StatusServiceUnavailable, resp)
-			return
+		if prov.IsOAuth() {
+			// OAuth providers don't support /models — just check token validity.
+			if !prov.OAuth.HasValidToken() {
+				resp["error"] = "oauth token expired or exhausted"
+				writeJSON(w, http.StatusServiceUnavailable, resp)
+				return
+			}
+		} else {
+			_, key, _ := prov.Keys.Current()
+			if err := a.checkUpstreamReady(r.Context(), prov.Config.BaseURL, key); err != nil {
+				resp["error"] = "upstream not ready"
+				writeJSON(w, http.StatusServiceUnavailable, resp)
+				return
+			}
 		}
 	} else {
 		_, key, ok := a.keys.Current()
@@ -865,6 +886,23 @@ func (a *App) handleValidateKeysMulti(w http.ResponseWriter, r *http.Request) {
 	}
 	var results []ProviderKeyResult
 	for _, prov := range a.router.providers {
+		if prov.IsOAuth() {
+			state := string(KeyUnknown)
+			errMsg := ""
+			if prov.OAuth.HasValidToken() {
+				state = string(KeyAvailable)
+			} else if prov.OAuth.IsExhausted() {
+				state = string(KeyExhausted)
+				errMsg = "quota exhausted — use admin reset or re-run oauth-login"
+			} else {
+				errMsg = "no valid token — run oauth-login"
+			}
+			results = append(results, ProviderKeyResult{
+				Provider:          prov.Config.Name,
+				ValidateKeyResult: ValidateKeyResult{Index: 0, State: state, Status: 0, Error: errMsg},
+			})
+			continue
+		}
 		for i, key := range prov.Config.APIKeys {
 			res := ProviderKeyResult{
 				Provider:          prov.Config.Name,
@@ -1002,8 +1040,9 @@ func (a *App) proxyMultiProvider(w http.ResponseWriter, r *http.Request, ctx con
 			}
 			if resp.StatusCode == http.StatusTooManyRequests && isQuota429(resp) {
 				_ = resp.Body.Close()
-				if err := prov.OAuth.SaveTokens(&OAuthTokens{Provider: prov.Config.Name}); err != nil {
-					log.Printf("oauth: failed to clear tokens: %v", err)
+				prov.OAuth.MarkExhausted()
+				if prov.OAuth.ShouldNotifyExhausted() {
+					a.sender.NotifySwitch(0, a.router.singleKeyStatus(prov.Config.Name, "exhausted"))
 				}
 				log.Printf("provider %q: oauth quota exhausted, falling through", prov.Config.Name)
 				continue

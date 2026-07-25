@@ -1046,3 +1046,173 @@ func TestOAuthProviderConfigValidation(t *testing.T) {
 		t.Fatal("api_key provider with no keys should fail validation")
 	}
 }
+
+func TestOAuthExhaustionAndReset(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	_ = os.MkdirAll(filepath.Join(dir, ".config", "switchboard-go"), 0o700)
+
+	store, _ := NewOAuthTokenStore("chatgpt")
+	store.SaveTokens(&OAuthTokens{
+		Provider:     "chatgpt",
+		AccessToken:  "valid-oauth-token",
+		RefreshToken: "rt",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	})
+	if !store.HasValidToken() {
+		t.Fatal("expected valid token initially")
+	}
+	// Mark exhausted
+	if err := store.MarkExhausted(); err != nil {
+		t.Fatal(err)
+	}
+	if store.HasValidToken() {
+		t.Fatal("exhausted token should not be valid")
+	}
+	if !store.IsExhausted() {
+		t.Fatal("expected IsExhausted true")
+	}
+	// Reset
+	if err := store.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if !store.HasValidToken() {
+		t.Fatal("reset token should be valid again")
+	}
+}
+
+func TestOAuthAdminResetKey(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	_ = os.MkdirAll(filepath.Join(dir, ".config", "switchboard-go"), 0o700)
+
+	store, _ := NewOAuthTokenStore("chatgpt")
+	store.SaveTokens(&OAuthTokens{
+		Provider:     "chatgpt",
+		AccessToken:  "valid-oauth-token",
+		RefreshToken: "rt",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	})
+	store.MarkExhausted()
+
+	cfg := Config{
+		ProxyAPIKey: "p",
+		Providers: []ProviderConfig{
+			{Name: "chatgpt", AuthType: "oauth", Priority: 0},
+			{Name: "fallback", BaseURL: "http://x", APIKeys: []string{"k"}, Priority: 1},
+		},
+		MaxRequestBodyBytes: 1024,
+		UpstreamBaseURL:     "http://x",
+	}
+	app := newApp(cfg)
+
+	// Verify it's exhausted
+	prov, _, _, ok := app.router.Current()
+	if !ok || prov.Config.Name != "fallback" {
+		t.Fatalf("expected fallback provider, got %v ok=%v", prov, ok)
+	}
+
+	// Admin reset the OAuth provider
+	body := bytes.NewReader([]byte(`{"provider":"chatgpt","index":0}`))
+	req := httptest.NewRequest(http.MethodPost, "/admin/reset-key", body)
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d body %s", rec.Code, rec.Body.String())
+	}
+
+	// OAuth provider should be current again
+	prov, _, _, ok = app.router.Current()
+	if !ok || prov.Config.Name != "chatgpt" {
+		t.Fatalf("expected chatgpt after reset, got %v ok=%v", prov, ok)
+	}
+}
+
+func TestOAuthValidateKeys(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	_ = os.MkdirAll(filepath.Join(dir, ".config", "switchboard-go"), 0o700)
+
+	store, _ := NewOAuthTokenStore("chatgpt")
+	store.SaveTokens(&OAuthTokens{
+		Provider:     "chatgpt",
+		AccessToken:  "valid",
+		RefreshToken: "rt",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	})
+
+	cfg := Config{
+		ProxyAPIKey: "p",
+		Providers: []ProviderConfig{
+			{Name: "chatgpt", AuthType: "oauth", Priority: 0},
+			{Name: "api", BaseURL: "http://x", APIKeys: []string{"k"}, Priority: 1},
+		},
+		MaxRequestBodyBytes: 1,
+		UpstreamBaseURL:     "http://x",
+	}
+	app := newApp(cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/validate-keys", nil)
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d body %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Results []struct {
+			Provider string `json:"provider"`
+			State    string `json:"state"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) < 1 {
+		t.Fatal("expected at least 1 result")
+	}
+	// First result should be chatgpt available
+	if out.Results[0].Provider != "chatgpt" || out.Results[0].State != string(KeyAvailable) {
+		t.Fatalf("result 0: %+v", out.Results[0])
+	}
+}
+
+func TestOAuthReadyz(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	_ = os.MkdirAll(filepath.Join(dir, ".config", "switchboard-go"), 0o700)
+
+	store, _ := NewOAuthTokenStore("chatgpt")
+	store.SaveTokens(&OAuthTokens{
+		Provider:     "chatgpt",
+		AccessToken:  "valid",
+		RefreshToken: "rt",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	})
+
+	cfg := Config{
+		ProxyAPIKey: "p",
+		Providers: []ProviderConfig{
+			{Name: "chatgpt", AuthType: "oauth", Priority: 0},
+		},
+		MaxRequestBodyBytes: 1024,
+		UpstreamBaseURL:     "http://x",
+	}
+	app := newApp(cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d body %s", rec.Code, rec.Body.String())
+	}
+
+	// Exhaust the token
+	store.MarkExhausted()
+	rec = httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code == http.StatusOK {
+		t.Fatal("expected non-200 readyz after oauth exhaustion")
+	}
+}

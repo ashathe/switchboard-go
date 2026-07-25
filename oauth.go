@@ -33,6 +33,7 @@ type OAuthTokens struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	ExpiresAt    int64  `json:"expires_at"` // unix seconds
+	Exhausted    bool   `json:"exhausted"`  // quota-exhausted, needs admin reset or re-auth
 }
 
 // OAuthTokenStore manages a single OAuth provider's tokens
@@ -44,6 +45,7 @@ type OAuthTokenStore struct {
 	mu           sync.Mutex
 	tokens       *OAuthTokens
 	refreshQueue *sync.Mutex // prevents concurrent refresh storms
+	notified     bool        // whether an exhaustion notification was already sent
 }
 
 // NewOAuthTokenStore creates a store that persists tokens to disk.
@@ -67,20 +69,78 @@ func NewOAuthTokenStore(providerName string) (*OAuthTokenStore, error) {
 	return s, nil
 }
 
-// HasValidToken reports whether a usable access token is available (not expired).
+// HasValidToken reports whether a usable access token is available (not expired
+// and not quota-exhausted). Re-reads from disk to stay in sync with admin ops.
 func (s *OAuthTokenStore) HasValidToken() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.reloadLocked()
 	return s.tokens != nil && s.tokens.AccessToken != "" &&
-		time.Now().Unix() < s.tokens.ExpiresAt-30 // 30s safety margin
+		!s.tokens.Exhausted &&
+		time.Now().Unix() < s.tokens.ExpiresAt-30
+}
+
+// IsExhausted reports whether the token was quota-exhausted and needs a reset.
+func (s *OAuthTokenStore) IsExhausted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reloadLocked()
+	return s.tokens != nil && s.tokens.Exhausted
+}
+
+// MarkExhausted flags the token as quota-exhausted. It does NOT clear the
+// refresh token so the provider can be reset via admin or auto-retry.
+func (s *OAuthTokenStore) MarkExhausted() error {
+	s.mu.Lock()
+	if s.tokens == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	s.tokens.Exhausted = true
+	err := s.persistLocked()
+	s.mu.Unlock()
+	return err
+}
+
+// Reset un-exhausts the token so it becomes eligible again.
+func (s *OAuthTokenStore) Reset() error {
+	s.mu.Lock()
+	if s.tokens == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	s.tokens.Exhausted = false
+	s.notified = false // re-arm notification for next exhaustion
+	err := s.persistLocked()
+	s.mu.Unlock()
+	return err
+}
+
+// ShouldNotifyExhausted returns true exactly once per exhaustion cycle.
+func (s *OAuthTokenStore) ShouldNotifyExhausted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.notified {
+		return false
+	}
+	if s.tokens == nil || !s.tokens.Exhausted {
+		return false
+	}
+	s.notified = true
+	return true
 }
 
 // AccessToken returns the current access token, refreshing if needed.
 func (s *OAuthTokenStore) AccessToken(ctx context.Context) (string, error) {
 	s.mu.Lock()
+	s.reloadLocked()
 	if s.tokens == nil || s.tokens.AccessToken == "" {
 		s.mu.Unlock()
 		return "", fmt.Errorf("no oauth token available — run 'switchboard-go oauth-login %s'", s.provider)
+	}
+	if s.tokens.Exhausted {
+		s.mu.Unlock()
+		return "", fmt.Errorf("oauth token quota-exhausted — use admin reset or re-run oauth-login")
 	}
 	if time.Now().Unix() < s.tokens.ExpiresAt-30 {
 		tok := s.tokens.AccessToken
@@ -96,7 +156,8 @@ func (s *OAuthTokenStore) AccessToken(ctx context.Context) (string, error) {
 
 	// Double-check after acquiring the refresh lock.
 	s.mu.Lock()
-	if s.tokens != nil && time.Now().Unix() < s.tokens.ExpiresAt-30 {
+	s.reloadLocked()
+	if s.tokens != nil && !s.tokens.Exhausted && time.Now().Unix() < s.tokens.ExpiresAt-30 {
 		tok := s.tokens.AccessToken
 		s.mu.Unlock()
 		return tok, nil
@@ -129,6 +190,18 @@ func (s *OAuthTokenStore) persistLocked() error {
 		return err
 	}
 	return os.WriteFile(s.path, data, 0o600)
+}
+
+// reloadLocked re-reads tokens from disk. Must be called with mu held.
+func (s *OAuthTokenStore) reloadLocked() {
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		return
+	}
+	var t OAuthTokens
+	if json.Unmarshal(data, &t) == nil && t.AccessToken != "" {
+		s.tokens = &t
+	}
 }
 
 // SaveTokens persists tokens after initial OAuth login.
