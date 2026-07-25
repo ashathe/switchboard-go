@@ -113,7 +113,7 @@ func TestDoUpstreamSetsDefaultUserAgent(t *testing.T) {
 
 	app := newApp(Config{ProxyAPIKey: "p", UpstreamAPIKeys: []string{"u"}, UpstreamBaseURL: upstream.URL})
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	resp, err := app.doUpstream(req.Context(), req, nil, "u", APIStyleOpenAI)
+	resp, err := app.doUpstream(req.Context(), req, nil, app.config.UpstreamBaseURL, "u", APIStyleOpenAI)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestDoUpstreamAnthropicSetsHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"minimax-m3","messages":[]}`))
 	req.Header.Set("x-api-key", "p")
 	req.Header.Set("anthropic-version", "2023-06-01")
-	resp, err := app.doUpstream(req.Context(), req, []byte(`{"model":"minimax-m3","messages":[]}`), "u", APIStyleAnthropic)
+	resp, err := app.doUpstream(req.Context(), req, []byte(`{"model":"minimax-m3","messages":[]}`), app.config.UpstreamBaseURL, "u", APIStyleAnthropic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -657,5 +657,256 @@ func TestLoadConfigRetryExhaustedAfterDefaultAndExplicitZero(t *testing.T) {
 	}
 	if cfg.RetryExhaustedAfter != 0 {
 		t.Fatalf("expected explicit 0 to disable cooldown, got %s", cfg.RetryExhaustedAfter)
+	}
+}
+
+// --- Multi-provider tests ---
+
+func TestProviderRouterPriorityOrder(t *testing.T) {
+	providers := []ProviderConfig{
+		{Name: "third", BaseURL: "http://c", APIKeys: []string{"k3"}, Priority: 30},
+		{Name: "first", BaseURL: "http://a", APIKeys: []string{"k1"}, Priority: 10},
+		{Name: "second", BaseURL: "http://b", APIKeys: []string{"k2"}, Priority: 20},
+	}
+	router, err := NewProviderRouter(providers, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should be sorted: first, second, third
+	prov, _, key, ok := router.Current()
+	if !ok || prov.Config.Name != "first" || key != "k1" {
+		t.Fatalf("expected first provider, got %q key=%q ok=%v", prov.Config.Name, key, ok)
+	}
+}
+
+func TestProviderRouterFallbackOnExhaustion(t *testing.T) {
+	var tried []string
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tried = append(tried, "a")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"quota exceeded","code":"insufficient_quota"}}`))
+	}))
+	defer upstreamA.Close()
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tried = append(tried, "b")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstreamB.Close()
+
+	cfg := Config{
+		ProxyAPIKey: "p",
+		Providers: []ProviderConfig{
+			{Name: "provider-a", BaseURL: upstreamA.URL, APIKeys: []string{"ka"}, Priority: 0},
+			{Name: "provider-b", BaseURL: upstreamB.URL, APIKeys: []string{"kb"}, Priority: 1},
+		},
+		MaxRequestBodyBytes:  1024,
+		RetryExhaustedAfter:  time.Minute,
+	}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	app := newApp(cfg)
+	if app.router == nil {
+		t.Fatal("expected router for multi-provider config")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body %s", rec.Code, rec.Body.String())
+	}
+	if strings.Join(tried, ",") != "a,b" {
+		t.Fatalf("expected providers tried in order a,b, got %v", tried)
+	}
+}
+
+func TestProviderRouterAllExhaustedReturns429(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"quota exceeded","code":"insufficient_quota"}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := Config{
+		ProxyAPIKey: "p",
+		Providers: []ProviderConfig{
+			{Name: "p1", BaseURL: upstream.URL, APIKeys: []string{"k1"}, Priority: 0},
+			{Name: "p2", BaseURL: upstream.URL, APIKeys: []string{"k2"}, Priority: 1},
+		},
+		MaxRequestBodyBytes:  1024,
+		RetryExhaustedAfter:  time.Hour,
+	}
+	app := newApp(cfg)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"test","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", rec.Code)
+	}
+}
+
+func TestLoadConfigWithProvidersYAML(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := []byte(`server:
+  listen_addr: "127.0.0.1:8080"
+  proxy_api_key: "p"
+providers:
+  - name: opencode-go
+    base_url: "https://opencode.ai/zen/go/v1"
+    api_keys: ["sk-go-1", "sk-go-2"]
+    priority: 0
+  - name: deepseek
+    base_url: "https://api.deepseek.com/v1"
+    api_keys: ["sk-ds-1"]
+    priority: 1
+`)
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SWITCHBOARD_GO_CONFIG", path)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Providers) != 2 {
+		t.Fatalf("expected 2 providers, got %d", len(cfg.Providers))
+	}
+	if cfg.Providers[0].Name != "opencode-go" || cfg.Providers[0].Priority != 0 {
+		t.Fatalf("unexpected provider 0: %+v", cfg.Providers[0])
+	}
+	if cfg.Providers[1].Name != "deepseek" || cfg.Providers[1].Priority != 1 {
+		t.Fatalf("unexpected provider 1: %+v", cfg.Providers[1])
+	}
+}
+
+func TestMultiProviderAdminStatus(t *testing.T) {
+	cfg := Config{
+		ProxyAPIKey: "p",
+		Providers: []ProviderConfig{
+			{Name: "go", BaseURL: "http://a", APIKeys: []string{"k1", "k2"}, Priority: 0},
+			{Name: "ds", BaseURL: "http://b", APIKeys: []string{"k3"}, Priority: 1},
+		},
+		MaxRequestBodyBytes: 1024,
+		UpstreamBaseURL:     "http://x",
+	}
+	app := newApp(cfg)
+	req := httptest.NewRequest(http.MethodGet, "/admin/status", nil)
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d body %s", rec.Code, rec.Body.String())
+	}
+	var status MultiProviderStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Providers) != 2 {
+		t.Fatalf("expected 2 providers in status, got %d", len(status.Providers))
+	}
+}
+
+func TestMultiProviderResetKey(t *testing.T) {
+	cfg := Config{
+		ProxyAPIKey: "p",
+		Providers: []ProviderConfig{
+			{Name: "go", BaseURL: "http://a", APIKeys: []string{"k1", "k2"}, Priority: 0},
+			{Name: "ds", BaseURL: "http://b", APIKeys: []string{"k3"}, Priority: 1},
+		},
+		MaxRequestBodyBytes: 1024,
+		UpstreamBaseURL:     "http://x",
+	}
+	app := newApp(cfg)
+	app.router.MarkExhausted(app.router.providers[0], 0)
+	app.router.MarkExhausted(app.router.providers[1], 0)
+
+	// Reset a specific key on provider "go"
+	body := bytes.NewReader([]byte(`{"provider":"go","index":0}`))
+	req := httptest.NewRequest(http.MethodPost, "/admin/reset-key", body)
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d body %s", rec.Code, rec.Body.String())
+	}
+	var status MultiProviderStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Providers[0].Keys[0].State != string(KeyAvailable) {
+		t.Fatalf("go key 0 should be available, got %s", status.Providers[0].Keys[0].State)
+	}
+	if status.Providers[1].Keys[0].State != string(KeyExhausted) {
+		t.Fatalf("ds key 0 should still be exhausted, got %s", status.Providers[1].Keys[0].State)
+	}
+}
+
+func TestMultiProviderValidateKeys(t *testing.T) {
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") == "Bearer good" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":[]}`))
+			return
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"quota exceeded","code":"insufficient_quota"}}`))
+	}))
+	defer upstreamA.Close()
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer upstreamB.Close()
+
+	cfg := Config{
+		ProxyAPIKey: "p",
+		Providers: []ProviderConfig{
+			{Name: "provider-a", BaseURL: upstreamA.URL, APIKeys: []string{"good", "bad"}, Priority: 0},
+			{Name: "provider-b", BaseURL: upstreamB.URL, APIKeys: []string{"ok"}, Priority: 1},
+		},
+		MaxRequestBodyBytes: 1,
+		UpstreamBaseURL:     "http://x",
+	}
+	app := newApp(cfg)
+	req := httptest.NewRequest(http.MethodPost, "/admin/validate-keys", nil)
+	req.Header.Set("Authorization", "Bearer p")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d body %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Results []struct {
+			Provider string `json:"provider"`
+			State    string `json:"state"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(out.Results))
+	}
+	// good key on provider-a
+	if out.Results[0].State != string(KeyAvailable) || out.Results[0].Provider != "provider-a" {
+		t.Fatalf("result 0: %+v", out.Results[0])
+	}
+	// bad key on provider-a
+	if out.Results[1].State != string(KeyExhausted) || out.Results[1].Provider != "provider-a" {
+		t.Fatalf("result 1: %+v", out.Results[1])
+	}
+	// ok key on provider-b
+	if out.Results[2].State != string(KeyAvailable) || out.Results[2].Provider != "provider-b" {
+		t.Fatalf("result 2: %+v", out.Results[2])
 	}
 }

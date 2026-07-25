@@ -25,6 +25,9 @@ OpenAI/Anthropic-compatible app -> http://127.0.0.1:8080/v1 -> OpenCode Go
 - Automatic failover when an upstream key is exhausted
 - Automatic retry of exhausted keys after a configurable cooldown, so a
   replenished account recovers without a restart or manual reset
+- **Multi-provider failover**: configure multiple upstream providers
+  (OpenCode Go, DeepSeek, Xiaomi, OpenAI, etc.) and Switchboard Go will
+  automatically fall through to the next provider when one is quota-exhausted
 - Optional YAML config, Docker, admin status, and SMTP alerts
 
 ## Install
@@ -108,12 +111,43 @@ For opencode and Pi Coding Agent examples, see
 YAML config is also supported. See
 [docs/configuration.md](docs/configuration.md).
 
+## Multi-provider failover
+
+When you have subscriptions with multiple providers, Switchboard Go can
+automatically fall through when one runs out of quota. Configure via YAML:
+
+```yaml
+providers:
+  - name: opencode-go
+    base_url: "https://opencode.ai/zen/go/v1"
+    api_keys: ["sk-go-1", "sk-go-2"]
+    priority: 0          # tried first
+  - name: deepseek
+    base_url: "https://api.deepseek.com/v1"
+    api_keys: ["sk-ds-1"]
+    priority: 1          # fallback after opencode-go is exhausted
+  - name: xiaomi
+    base_url: "https://api.xiaomi.com/v1"
+    api_keys: ["sk-xm-1"]
+    priority: 2          # last resort
+```
+
+Providers are tried in priority order (lowest first). Within each provider,
+keys cycle with the same cooldown-and-retry logic as single-provider mode.
+A local 429 with `Retry-After` is returned only when **all** providers are
+exhausted.
+
+Without a `providers` block, Switchboard Go falls back to legacy single-provider
+mode (env vars `OPENCODE_GO_API_KEYS` + `UPSTREAM_BASE_URL`).
+
 ## Admin endpoints
 
 Use `Authorization: Bearer $PROXY_API_KEY`:
 
-- `GET /admin/status`
-- `POST /admin/validate-keys`
+- `GET /admin/status` — per-provider, per-key status
+- `POST /admin/validate-keys` — validate all keys across all providers
+- `POST /admin/reset-key` — un-exhaust a single key by provider + index
+- `POST /admin/reset-all-keys` — un-exhaust every key across all providers
 
 Health checks:
 

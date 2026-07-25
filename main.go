@@ -39,6 +39,11 @@ type Config struct {
 	RetryExhaustedAfter time.Duration
 	ConfigSourcePath    string
 
+	// Multi-provider support. When non-empty, Providers replaces the legacy
+	// single-upstream fields (UpstreamBaseURL, UpstreamAPIKeys) for routing.
+	// Providers are tried in priority order (lowest first).
+	Providers []ProviderConfig
+
 	SMTP SMTPConfig
 }
 
@@ -111,6 +116,12 @@ type yamlConfig struct {
 		APIKeys             []string `yaml:"api_keys"`
 		RetryExhaustedAfter string   `yaml:"retry_exhausted_after"`
 	} `yaml:"upstream"`
+	Providers []struct {
+		Name     string   `yaml:"name"`
+		BaseURL  string   `yaml:"base_url"`
+		APIKeys  []string `yaml:"api_keys"`
+		Priority int      `yaml:"priority"`
+	} `yaml:"providers"`
 	SMTP struct {
 		Host     string `yaml:"host"`
 		Username string `yaml:"username"`
@@ -148,7 +159,18 @@ func loadYAMLConfig(path string) (Config, error) {
 		}
 		retry = d
 	}
-	return Config{ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}}, nil
+	// Parse providers from YAML.
+	providers := make([]ProviderConfig, 0, len(yc.Providers))
+	for _, p := range yc.Providers {
+		providers = append(providers, ProviderConfig{
+			Name:     p.Name,
+			BaseURL:  p.BaseURL,
+			APIKeys:  p.APIKeys,
+			Priority: p.Priority,
+		})
+	}
+
+	return Config{ListenAddr: yc.Server.ListenAddr, UpstreamBaseURL: yc.Upstream.BaseURL, ProxyAPIKey: yc.Server.ProxyAPIKey, UpstreamAPIKeys: yc.Upstream.APIKeys, MaxRequestBodyBytes: yc.Limits.MaxRequestBodyBytes, RetryExhaustedAfter: retry, Providers: providers, SMTP: SMTPConfig{Host: yc.SMTP.Host, Port: yc.SMTP.Port, Username: yc.SMTP.Username, Password: yc.SMTP.Password, From: yc.SMTP.From, To: yc.SMTP.To, TLS: yc.SMTP.TLS, StartTLS: yc.SMTP.StartTLS}}, nil
 }
 
 func mergeConfig(dst *Config, src Config) {
@@ -163,6 +185,9 @@ func mergeConfig(dst *Config, src Config) {
 	}
 	if len(src.UpstreamAPIKeys) > 0 {
 		dst.UpstreamAPIKeys = append([]string(nil), src.UpstreamAPIKeys...)
+	}
+	if len(src.Providers) > 0 {
+		dst.Providers = append([]ProviderConfig(nil), src.Providers...)
 	}
 	if src.MaxRequestBodyBytes > 0 {
 		dst.MaxRequestBodyBytes = src.MaxRequestBodyBytes
@@ -262,8 +287,19 @@ func validateConfig(cfg Config) error {
 	if strings.TrimSpace(cfg.ProxyAPIKey) == "" {
 		return errors.New("PROXY_API_KEY is required")
 	}
-	if len(cfg.UpstreamAPIKeys) == 0 {
-		return errors.New("OPENCODE_GO_API_KEYS is required")
+	if len(cfg.UpstreamAPIKeys) == 0 && len(cfg.Providers) == 0 {
+		return errors.New("OPENCODE_GO_API_KEYS or providers is required")
+	}
+	if len(cfg.Providers) > 0 {
+		for _, p := range cfg.Providers {
+			if strings.TrimSpace(p.BaseURL) == "" {
+				return fmt.Errorf("provider %q: base_url is required", p.Name)
+			}
+			if len(p.APIKeys) == 0 {
+				return fmt.Errorf("provider %q: at least one api_key is required", p.Name)
+			}
+		}
+		return nil
 	}
 	if strings.TrimSpace(cfg.UpstreamBaseURL) == "" {
 		return errors.New("UPSTREAM_BASE_URL is required")
@@ -278,7 +314,15 @@ func validateConfig(cfg Config) error {
 }
 
 func safeConfigSummary(cfg Config) string {
-	return fmt.Sprintf("listen=%s upstream=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter)
+	providerInfo := fmt.Sprintf("upstream_keys=%d", len(cfg.UpstreamAPIKeys))
+	if len(cfg.Providers) > 0 {
+		names := make([]string, 0, len(cfg.Providers))
+		for _, p := range cfg.Providers {
+			names = append(names, p.Name)
+		}
+		providerInfo = fmt.Sprintf("providers=%d (%s)", len(cfg.Providers), strings.Join(names, ", "))
+	}
+	return fmt.Sprintf("listen=%s upstream=%s %s smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, providerInfo, cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter)
 }
 
 func parseBool(v string) bool { b, _ := strconv.ParseBool(strings.TrimSpace(v)); return b }
@@ -543,13 +587,27 @@ type ValidateKeysResponse struct {
 
 type App struct {
 	config Config
-	keys   *KeyManager
+	keys   *KeyManager      // legacy single-provider
+	router *ProviderRouter  // multi-provider
 	client *http.Client
 	sender *SMTPNotifier
 }
 
 func newApp(cfg Config) *App {
-	return &App{config: cfg, keys: NewKeyManager(cfg.UpstreamAPIKeys, cfg.RetryExhaustedAfter), client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 30 * time.Second, ExpectContinueTimeout: 2 * time.Second}}, sender: NewSMTPNotifier(cfg.SMTP)}
+	app := &App{
+		config: cfg,
+		keys:   NewKeyManager(cfg.UpstreamAPIKeys, cfg.RetryExhaustedAfter),
+		client: &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 30 * time.Second, ExpectContinueTimeout: 2 * time.Second}},
+		sender: NewSMTPNotifier(cfg.SMTP),
+	}
+	if len(cfg.Providers) > 0 {
+		router, err := NewProviderRouter(cfg.Providers, cfg.RetryExhaustedAfter)
+		if err != nil {
+			log.Fatalf("provider config error: %v", err)
+		}
+		app.router = router
+	}
+	return app
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -615,22 +673,44 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		a.handleResetKey(w, r)
 	case r.URL.Path == "/admin/reset-all-keys" && r.Method == http.MethodPost:
 		a.handleResetAllKeys(w, r)
-	case r.URL.Path == "/admin/status" && r.Method == http.MethodGet:
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(a.keys.Status())
+		case r.URL.Path == "/admin/status" && r.Method == http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			if a.router != nil && a.router.NumProviders() > 1 {
+				_ = json.NewEncoder(w).Encode(a.router.MultiStatus())
+			} else {
+				_ = json.NewEncoder(w).Encode(a.keys.Status())
+			}
 	default:
 		http.NotFound(w, r)
 	}
 }
 
 // handleResetKey un-exhausts a single upstream key by index, without restarting
-// the proxy. Body: {"index": <int>}. Responds with the updated status.
+// the proxy. Body: {"index": <int>} or {"provider": "<name>", "index": <int>}.
+// Responds with the updated status.
 func (a *App) handleResetKey(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Index int `json:"index"`
+		Provider string `json:"provider"`
+		Index    int    `json:"index"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body); err != nil {
 		http.Error(w, "invalid json body", http.StatusBadRequest)
+		return
+	}
+	if a.router != nil && body.Provider != "" {
+		for _, prov := range a.router.providers {
+			if prov.Config.Name == body.Provider {
+				if body.Index < 0 || body.Index >= len(prov.Config.APIKeys) {
+					http.Error(w, "index out of range", http.StatusBadRequest)
+					return
+				}
+				a.router.MarkAvailable(prov, body.Index)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(a.router.MultiStatus())
+				return
+			}
+		}
+		http.Error(w, "provider not found", http.StatusBadRequest)
 		return
 	}
 	if body.Index < 0 || body.Index >= len(a.config.UpstreamAPIKeys) {
@@ -644,6 +724,16 @@ func (a *App) handleResetKey(w http.ResponseWriter, r *http.Request) {
 
 // handleResetAllKeys un-exhausts every upstream key, without restarting.
 func (a *App) handleResetAllKeys(w http.ResponseWriter, r *http.Request) {
+	if a.router != nil {
+		for _, prov := range a.router.providers {
+			for i := range prov.Config.APIKeys {
+				a.router.MarkAvailable(prov, i)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(a.router.MultiStatus())
+		return
+	}
 	for i := range a.config.UpstreamAPIKeys {
 		a.keys.MarkAvailable(i)
 	}
@@ -657,15 +747,28 @@ func (a *App) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, resp)
 		return
 	}
-	_, key, ok := a.keys.Current()
-	if !ok {
-		writeJSON(w, http.StatusServiceUnavailable, resp)
-		return
-	}
-	if err := a.checkUpstreamReady(r.Context(), key); err != nil {
-		resp["error"] = "upstream not ready"
-		writeJSON(w, http.StatusServiceUnavailable, resp)
-		return
+	if a.router != nil {
+		prov, _, key, ok := a.router.Current()
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, resp)
+			return
+		}
+		if err := a.checkUpstreamReady(r.Context(), prov.Config.BaseURL, key); err != nil {
+			resp["error"] = "upstream not ready"
+			writeJSON(w, http.StatusServiceUnavailable, resp)
+			return
+		}
+	} else {
+		_, key, ok := a.keys.Current()
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, resp)
+			return
+		}
+		if err := a.checkUpstreamReady(r.Context(), a.config.UpstreamBaseURL, key); err != nil {
+			resp["error"] = "upstream not ready"
+			writeJSON(w, http.StatusServiceUnavailable, resp)
+			return
+		}
 	}
 	resp["ready"] = true
 	writeJSON(w, http.StatusOK, resp)
@@ -677,10 +780,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func (a *App) checkUpstreamReady(ctx context.Context, key string) error {
+func (a *App) checkUpstreamReady(ctx context.Context, baseURL string, key string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.config.UpstreamBaseURL, "/")+"/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/models", nil)
 	if err != nil {
 		return err
 	}
@@ -698,6 +801,10 @@ func (a *App) checkUpstreamReady(ctx context.Context, key string) error {
 }
 
 func (a *App) handleValidateKeys(w http.ResponseWriter, r *http.Request) {
+	if a.router != nil {
+		a.handleValidateKeysMulti(w, r)
+		return
+	}
 	results := make([]ValidateKeyResult, 0, len(a.config.UpstreamAPIKeys))
 	for i, key := range a.config.UpstreamAPIKeys {
 		res := ValidateKeyResult{Index: i}
@@ -746,6 +853,64 @@ func (a *App) handleValidateKeys(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ValidateKeysResponse{Results: results})
 }
 
+func (a *App) handleValidateKeysMulti(w http.ResponseWriter, r *http.Request) {
+	type ProviderKeyResult struct {
+		Provider string `json:"provider"`
+		ValidateKeyResult
+	}
+	var results []ProviderKeyResult
+	for _, prov := range a.router.providers {
+		for i, key := range prov.Config.APIKeys {
+			res := ProviderKeyResult{
+				Provider:          prov.Config.Name,
+				ValidateKeyResult: ValidateKeyResult{Index: i},
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(prov.Config.BaseURL, "/")+"/models", nil)
+			if err != nil {
+				cancel()
+				res.State = string(KeyUnknown)
+				res.Status = http.StatusBadGateway
+				res.Error = err.Error()
+				results = append(results, res)
+				continue
+			}
+			req.Header.Set("Authorization", "Bearer "+key)
+			req.Header.Set("User-Agent", "OpenAI/Python 1.0.0")
+			resp, err := a.client.Do(req)
+			cancel()
+			if err != nil {
+				res.State = string(KeyUnknown)
+				res.Status = http.StatusBadGateway
+				res.Error = err.Error()
+				results = append(results, res)
+				continue
+			}
+			res.Status = resp.StatusCode
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				prov.Keys.MarkAvailable(i)
+				res.State = string(KeyAvailable)
+			} else if resp.StatusCode == http.StatusTooManyRequests && isQuota429(resp) {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				prov.Keys.SetState(i, KeyExhausted)
+				res.State = string(KeyExhausted)
+				res.Error = "quota exhausted"
+			} else {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				prov.Keys.SetState(i, KeyUnknown)
+				res.State = string(KeyUnknown)
+				res.Error = fmt.Sprintf("status %d", resp.StatusCode)
+			}
+			results = append(results, res)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
 func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	r.Body = http.MaxBytesReader(w, r.Body, a.config.MaxRequestBodyBytes)
 	body, err := io.ReadAll(r.Body)
@@ -759,12 +924,22 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	}
 	_ = r.Body.Close()
 	orig := r.Context()
+
+	if a.router != nil {
+		a.proxyMultiProvider(w, r, orig, body, style)
+		return
+	}
+	a.proxySingleProvider(w, r, orig, body, style)
+}
+
+// proxySingleProvider is the legacy route: one upstream with a flat key pool.
+func (a *App) proxySingleProvider(w http.ResponseWriter, r *http.Request, ctx context.Context, body []byte, style APIStyle) {
 	for attempts := 0; attempts < len(a.config.UpstreamAPIKeys); attempts++ {
 		idx, key, ok := a.keys.Current()
 		if !ok {
 			break
 		}
-		resp, reqErr := a.doUpstream(orig, r, body, key, style)
+		resp, reqErr := a.doUpstream(ctx, r, body, a.config.UpstreamBaseURL, key, style)
 		if reqErr != nil {
 			http.Error(w, reqErr.Error(), http.StatusBadGateway)
 			return
@@ -777,15 +952,10 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 			}
 			continue
 		}
-		// The key served the request, so it is healthy: mark it available so a
-		// recovered (previously exhausted) key un-sticks and the notification
-		// flags re-arm for the next depletion round.
 		a.keys.MarkAvailable(idx)
 		copyResponse(w, resp)
 		return
 	}
-	// No eligible key remains. Fail fast locally instead of hammering upstream,
-	// and hint well-behaved clients at the next probe window via Retry-After.
 	if a.keys.ShouldNotifyAllExhausted() {
 		a.sender.NotifyAllExhausted(a.keys.Status())
 	}
@@ -795,12 +965,54 @@ func (a *App) proxyV1(w http.ResponseWriter, r *http.Request, style APIStyle) {
 	writeAPIError(w, style, http.StatusTooManyRequests, "rate_limit_exceeded", "all upstream keys exhausted")
 }
 
-func (a *App) doUpstream(ctx context.Context, r *http.Request, body []byte, key string, apiStyle APIStyle) (*http.Response, error) {
+// proxyMultiProvider tries providers in priority order. When one provider's
+// keys are quota-exhausted, it falls through to the next provider's key pool.
+func (a *App) proxyMultiProvider(w http.ResponseWriter, r *http.Request, ctx context.Context, body []byte, style APIStyle) {
+	totalKeys := 0
+	for _, prov := range a.router.providers {
+		totalKeys += len(prov.Config.APIKeys)
+	}
+	for attempts := 0; attempts < totalKeys; attempts++ {
+		prov, keyIdx, key, ok := a.router.Current()
+		if !ok {
+			break
+		}
+		resp, reqErr := a.doUpstream(ctx, r, body, prov.Config.BaseURL, key, style)
+		if reqErr != nil {
+			http.Error(w, reqErr.Error(), http.StatusBadGateway)
+			return
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && isQuota429(resp) {
+			_ = resp.Body.Close()
+			a.router.MarkExhausted(prov, keyIdx)
+			if prov.Keys.ShouldNotifySwitch(keyIdx) {
+				a.sender.NotifySwitch(keyIdx, prov.Keys.Status())
+			}
+			continue
+		}
+		a.router.MarkAvailable(prov, keyIdx)
+		copyResponse(w, resp)
+		return
+	}
+	if a.router.AllExhausted() {
+		for _, prov := range a.router.providers {
+			if prov.Keys.AllExhausted() {
+				a.sender.NotifyAllExhausted(prov.Keys.Status())
+			}
+		}
+	}
+	if secs, ok := a.router.RetryAfterSeconds(); ok {
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+	}
+	writeAPIError(w, style, http.StatusTooManyRequests, "rate_limit_exceeded", "all upstream providers and keys exhausted")
+}
+
+func (a *App) doUpstream(ctx context.Context, r *http.Request, body []byte, baseURL string, key string, apiStyle APIStyle) (*http.Response, error) {
 	path := strings.TrimPrefix(r.URL.EscapedPath(), "/v1")
 	if path == "" {
 		path = "/"
 	}
-	u := a.config.UpstreamBaseURL + path
+	u := baseURL + path
 	if r.URL.RawQuery != "" {
 		u += "?" + r.URL.RawQuery
 	}
@@ -1043,7 +1255,7 @@ func main() {
 		defer cancel()
 		_ = srv.Shutdown(shut)
 	}()
-	log.Printf("startup listen_addr=%s upstream_base_url=%s upstream_keys=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter)
+	log.Printf("startup listen_addr=%s upstream_base_url=%s upstream_keys=%d providers=%d smtp_configured=%t config_source=%s max_request_body_bytes=%d retry_exhausted_after=%s", cfg.ListenAddr, cfg.UpstreamBaseURL, len(cfg.UpstreamAPIKeys), len(cfg.Providers), cfg.SMTP.Host != "" && cfg.SMTP.From != "" && cfg.SMTP.To != "", defaultString(cfg.ConfigSourcePath, "none"), cfg.MaxRequestBodyBytes, cfg.RetryExhaustedAfter)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
