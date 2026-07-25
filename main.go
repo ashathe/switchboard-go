@@ -229,15 +229,18 @@ func applyEnvOverrides(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("PROXY_API_KEY")); v != "" {
 		cfg.ProxyAPIKey = v
 	}
-	if v := strings.TrimSpace(os.Getenv("OPENCODE_GO_API_KEYS")); v != "" {
-		var keys []string
-		for _, k := range strings.Split(v, ",") {
-			if s := strings.TrimSpace(k); s != "" {
-				keys = append(keys, s)
+	// Only apply legacy env vars when YAML didn't set providers.
+	if len(cfg.Providers) == 0 {
+		if v := strings.TrimSpace(os.Getenv("OPENCODE_GO_API_KEYS")); v != "" {
+			var keys []string
+			for _, k := range strings.Split(v, ",") {
+				if s := strings.TrimSpace(k); s != "" {
+					keys = append(keys, s)
+				}
 			}
-		}
-		if len(keys) > 0 {
-			cfg.UpstreamAPIKeys = keys
+			if len(keys) > 0 {
+				cfg.UpstreamAPIKeys = keys
+			}
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("MAX_REQUEST_BODY_BYTES")); v != "" {
