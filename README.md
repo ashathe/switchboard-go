@@ -1,8 +1,12 @@
-<p align="center">
-  <img src="assets/logo.png" alt="Switchboard Go logo" width="220">
-</p>
 
 <h1 align="center">Switchboard Go</h1>
+
+
+
+THIS IS A FORK
+
+I am attempting to get this to work for other services as well for people who have multiple providers
+
 
 Switchboard Go is a small local proxy for the OpenCode Go API.
 
