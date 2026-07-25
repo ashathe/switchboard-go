@@ -131,6 +131,9 @@ func (r *ProviderRouter) RetryAfterSeconds() (int, bool) {
 	var soonest int
 	found := false
 	for _, p := range r.providers {
+		if p.Keys == nil {
+			continue // OAuth providers use a different retry model
+		}
 		if secs, ok := p.Keys.RetryAfterSeconds(); ok {
 			if !found || secs < soonest {
 				soonest = secs

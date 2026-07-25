@@ -408,6 +408,14 @@ func (m *KeyManager) MarkExhausted(i int) {
 	m.advanceLocked()
 }
 
+// Skip advances past the current key without marking it exhausted — used when
+// the key is healthy but the provider doesn't support the requested model.
+func (m *KeyManager) Skip() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.advanceLocked()
+}
+
 func (m *KeyManager) ShouldNotifySwitch(i int) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1012,7 +1020,8 @@ func (a *App) proxySingleProvider(w http.ResponseWriter, r *http.Request, ctx co
 }
 
 // proxyMultiProvider tries providers in priority order. When one provider's
-// keys are quota-exhausted, it falls through to the next provider's key pool.
+// keys are quota-exhausted or the model is unsupported, it falls through to
+// the next provider's key pool.
 // OAuth providers use the ChatGPT Codex endpoint with auto-refreshed tokens.
 func (a *App) proxyMultiProvider(w http.ResponseWriter, r *http.Request, ctx context.Context, body []byte, style APIStyle) {
 	totalKeys := 0
@@ -1041,6 +1050,12 @@ func (a *App) proxyMultiProvider(w http.ResponseWriter, r *http.Request, ctx con
 				http.Error(w, reqErr.Error(), http.StatusBadGateway)
 				return
 			}
+			if isModelNotSupported(resp) {
+				_ = resp.Body.Close()
+				prov.OAuth.MarkExhausted()
+				log.Printf("provider %q: model not supported via oauth, skipping", prov.Config.Name)
+				continue
+			}
 			if resp.StatusCode == http.StatusTooManyRequests && isQuota429(resp) {
 				_ = resp.Body.Close()
 				prov.OAuth.MarkExhausted()
@@ -1059,6 +1074,15 @@ func (a *App) proxyMultiProvider(w http.ResponseWriter, r *http.Request, ctx con
 			http.Error(w, reqErr.Error(), http.StatusBadGateway)
 			return
 		}
+		if isModelNotSupported(resp) {
+			_ = resp.Body.Close()
+			// Mark all keys exhausted so Current() skips this provider entirely.
+			for i := range prov.Config.APIKeys {
+				prov.Keys.MarkExhausted(i)
+			}
+			log.Printf("provider %q: model not supported, skipping all %d keys", prov.Config.Name, len(prov.Config.APIKeys))
+			continue
+		}
 		if resp.StatusCode == http.StatusTooManyRequests && isQuota429(resp) {
 			_ = resp.Body.Close()
 			a.router.MarkExhausted(prov, keyIdx)
@@ -1073,7 +1097,13 @@ func (a *App) proxyMultiProvider(w http.ResponseWriter, r *http.Request, ctx con
 	}
 	if a.router.AllExhausted() {
 		for _, prov := range a.router.providers {
-			if !prov.IsOAuth() && prov.Keys.AllExhausted() {
+			if prov.IsOAuth() {
+				if prov.OAuth.IsExhausted() {
+					a.sender.NotifyAllExhausted(a.router.singleKeyStatus(prov.Config.Name, "exhausted"))
+				}
+				continue
+			}
+			if prov.Keys.AllExhausted() {
 				a.sender.NotifyAllExhausted(prov.Keys.Status())
 			}
 		}
@@ -1088,6 +1118,18 @@ func (a *App) proxyMultiProvider(w http.ResponseWriter, r *http.Request, ctx con
 // Unlike doUpstream, this uses a fixed URL — the Codex endpoint handles
 // chat/completions and responses natively without path routing.
 func (a *App) doOAuthUpstream(ctx context.Context, r *http.Request, body []byte, token string) (*http.Response, error) {
+	// Inject params required by ChatGPT Codex endpoint
+	if len(body) > 0 {
+		var m map[string]any
+		if err := json.Unmarshal(body, &m); err == nil {
+			m["store"] = false
+			m["stream"] = true
+			delete(m, "max_tokens") // Codex rejects this
+			if b, err := json.Marshal(m); err == nil {
+				body = b
+			}
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, r.Method, openAICodexAPIEndpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -1192,6 +1234,28 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+// isModelNotSupported checks whether the upstream rejected the request because
+// the model is not available on this provider. The proxy treats this like a
+// quota 429 and tries the next provider so the chain can find one that supports
+// the model (e.g. gpt-5.6-terra is rejected by OpenCode Go but works on ChatGPT).
+func isModelNotSupported(resp *http.Response) bool {
+	if resp.StatusCode < 400 || resp.StatusCode >= 500 {
+		return false
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "model") &&
+		(strings.Contains(lower, "not supported") ||
+			strings.Contains(lower, "not found") ||
+			strings.Contains(lower, "does not exist") ||
+			strings.Contains(lower, "model not available") ||
+			strings.Contains(lower, "supported api model") ||
+			strings.Contains(lower, "you passed"))
+}
+
+// isQuota429 checks whether the response is a quota-exhaustion 429.
 func isQuota429(resp *http.Response) bool {
 	if resp.StatusCode != 429 {
 		return false
