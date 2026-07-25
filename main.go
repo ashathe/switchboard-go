@@ -991,26 +991,23 @@ func (a *App) proxyMultiProvider(w http.ResponseWriter, r *http.Request, ctx con
 			token, err := prov.OAuth.AccessToken(ctx)
 			if err != nil {
 				log.Printf("oauth provider %q: %v", prov.Config.Name, err)
-				// Token expired/refresh failed — skip to next provider.
 				continue
 			}
-			// OAuth providers go to the ChatGPT Codex endpoint.
-			resp, reqErr := a.doUpstream(ctx, r, body, openAICodexAPIEndpoint, token, style)
+			// OAuth providers use the ChatGPT Codex endpoint directly —
+			// it's a fixed URL, not a base URL for path concatenation.
+			resp, reqErr := a.doOAuthUpstream(ctx, r, body, token)
 			if reqErr != nil {
 				http.Error(w, reqErr.Error(), http.StatusBadGateway)
 				return
 			}
 			if resp.StatusCode == http.StatusTooManyRequests && isQuota429(resp) {
 				_ = resp.Body.Close()
-				// OAuth token is quota-exhausted — mark it so the router
-				// falls through to the next provider.
 				if err := prov.OAuth.SaveTokens(&OAuthTokens{Provider: prov.Config.Name}); err != nil {
 					log.Printf("oauth: failed to clear tokens: %v", err)
 				}
 				log.Printf("provider %q: oauth quota exhausted, falling through", prov.Config.Name)
 				continue
 			}
-			// Non-429 — token is fine, let the response through.
 			copyResponse(w, resp)
 			return
 		}
@@ -1043,6 +1040,24 @@ func (a *App) proxyMultiProvider(w http.ResponseWriter, r *http.Request, ctx con
 		w.Header().Set("Retry-After", strconv.Itoa(secs))
 	}
 	writeAPIError(w, style, http.StatusTooManyRequests, "rate_limit_exceeded", "all upstream providers and keys exhausted")
+}
+
+// doOAuthUpstream sends a request directly to the ChatGPT Codex endpoint.
+// Unlike doUpstream, this uses a fixed URL — the Codex endpoint handles
+// chat/completions and responses natively without path routing.
+func (a *App) doOAuthUpstream(ctx context.Context, r *http.Request, body []byte, token string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, r.Method, openAICodexAPIEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	copyHeaders(req.Header, r.Header)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("ChatGPT-Account-Id", "")
+	if strings.TrimSpace(req.Header.Get("User-Agent")) == "" {
+		req.Header.Set("User-Agent", "OpenAI/Python 1.0.0")
+	}
+	stripHopByHopHeaders(req.Header)
+	return a.client.Do(req)
 }
 
 func (a *App) doUpstream(ctx context.Context, r *http.Request, body []byte, baseURL string, key string, apiStyle APIStyle) (*http.Response, error) {
