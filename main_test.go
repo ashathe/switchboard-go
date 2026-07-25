@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -908,5 +909,140 @@ func TestMultiProviderValidateKeys(t *testing.T) {
 	// ok key on provider-b
 	if out.Results[2].State != string(KeyAvailable) || out.Results[2].Provider != "provider-b" {
 		t.Fatalf("result 2: %+v", out.Results[2])
+	}
+}
+
+// --- OAuth provider tests ---
+
+func TestOAuthTokenStoreLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	_ = os.MkdirAll(filepath.Join(dir, ".config", "switchboard-go"), 0o700)
+
+	store, err := NewOAuthTokenStore("test-oauth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.HasValidToken() {
+		t.Fatal("expected no valid token on fresh store")
+	}
+	_, err = store.AccessToken(context.Background())
+	if err == nil {
+		t.Fatal("expected error accessing token on fresh store")
+	}
+	// Save valid tokens
+	tokens := &OAuthTokens{
+		Provider:     "test-oauth",
+		AccessToken:  "at-123",
+		RefreshToken: "rt-456",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	}
+	if err := store.SaveTokens(tokens); err != nil {
+		t.Fatal(err)
+	}
+	if !store.HasValidToken() {
+		t.Fatal("expected valid token after save")
+	}
+	tok, err := store.AccessToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "at-123" {
+		t.Fatalf("got token %q", tok)
+	}
+}
+
+func TestOAuthTokenExpiredTriggersRefreshAttempt(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	_ = os.MkdirAll(filepath.Join(dir, ".config", "switchboard-go"), 0o700)
+
+	store, err := NewOAuthTokenStore("test-oauth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Save expired tokens
+	tokens := &OAuthTokens{
+		Provider:     "test-oauth",
+		AccessToken:  "expired-at",
+		RefreshToken: "rt-expired",
+		ExpiresAt:    time.Now().Add(-time.Hour).Unix(),
+	}
+	if err := store.SaveTokens(tokens); err != nil {
+		t.Fatal(err)
+	}
+	if store.HasValidToken() {
+		t.Fatal("expired token should not report as valid")
+	}
+	// AccessToken should attempt refresh and fail (no real server)
+	_, err = store.AccessToken(context.Background())
+	if err == nil {
+		t.Fatal("expected refresh failure for expired token")
+	}
+}
+
+func TestProviderWithOAuthType(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	_ = os.MkdirAll(filepath.Join(dir, ".config", "switchboard-go"), 0o700)
+
+	// Create a real OAuth token store with valid tokens
+	store, _ := NewOAuthTokenStore("chatgpt")
+	store.SaveTokens(&OAuthTokens{
+		Provider:     "chatgpt",
+		AccessToken:  "valid-oauth-token",
+		RefreshToken: "rt",
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	})
+
+	cfg := Config{
+		ProxyAPIKey: "p",
+		Providers: []ProviderConfig{
+			{Name: "chatgpt", AuthType: "oauth", Priority: 0},
+		},
+		MaxRequestBodyBytes: 1024,
+		UpstreamBaseURL:     "http://x",
+	}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	app := newApp(cfg)
+	if app.router == nil {
+		t.Fatal("expected router")
+	}
+	prov, _, _, ok := app.router.Current()
+	if !ok {
+		t.Fatal("expected oauth provider to be current")
+	}
+	if !prov.IsOAuth() {
+		t.Fatal("expected oauth provider")
+	}
+	if prov.OAuth == nil {
+		t.Fatal("expected oauth store")
+	}
+}
+
+func TestOAuthProviderConfigValidation(t *testing.T) {
+	// OAuth providers don't need api_keys or base_url
+	cfg := Config{
+		ProxyAPIKey: "p",
+		Providers: []ProviderConfig{
+			{Name: "chatgpt", AuthType: "oauth", Priority: 0},
+		},
+		MaxRequestBodyBytes: 1024,
+	}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("oauth provider should validate without api_keys/base_url: %v", err)
+	}
+	// api_key providers still need keys
+	cfg2 := Config{
+		ProxyAPIKey: "p",
+		Providers: []ProviderConfig{
+			{Name: "bad", BaseURL: "http://x", APIKeys: []string{}, Priority: 0},
+		},
+		MaxRequestBodyBytes: 1024,
+	}
+	if err := validateConfig(cfg2); err == nil {
+		t.Fatal("api_key provider with no keys should fail validation")
 	}
 }

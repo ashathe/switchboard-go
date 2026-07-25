@@ -144,6 +144,34 @@ exhausted.
 Without a `providers` block, Switchboard Go falls back to legacy single-provider
 mode (env vars `OPENCODE_GO_API_KEYS` + `UPSTREAM_BASE_URL`).
 
+### ChatGPT Plus (OAuth)
+
+You can use a ChatGPT Plus subscription as a fallback provider without an API
+key. Switchboard Go will authenticate via browser OAuth and auto-refresh the
+token:
+
+```yaml
+providers:
+  - name: opencode-go
+    base_url: "https://opencode.ai/zen/go/v1"
+    api_keys: ["sk-go-1"]
+    priority: 0
+  - name: chatgpt-plus
+    auth_type: oauth       # browser OAuth PKCE flow
+    priority: 1
+```
+
+Before first use, authenticate once:
+
+```bash
+switchboard-go oauth-login chatgpt-plus
+```
+
+This opens your browser to the ChatGPT consent screen, exchanges the code for
+tokens, and saves them to `~/.config/switchboard-go/chatgpt-plus-oauth.json`.
+The access token auto-refreshes and the proxy will fall through to ChatGPT
+when your other providers run out of quota.
+
 ## Admin endpoints
 
 Use `Authorization: Bearer $PROXY_API_KEY`:

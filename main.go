@@ -121,6 +121,7 @@ type yamlConfig struct {
 		BaseURL  string   `yaml:"base_url"`
 		APIKeys  []string `yaml:"api_keys"`
 		Priority int      `yaml:"priority"`
+		AuthType string   `yaml:"auth_type"`
 	} `yaml:"providers"`
 	SMTP struct {
 		Host     string `yaml:"host"`
@@ -167,6 +168,7 @@ func loadYAMLConfig(path string) (Config, error) {
 			BaseURL:  p.BaseURL,
 			APIKeys:  p.APIKeys,
 			Priority: p.Priority,
+			AuthType: p.AuthType,
 		})
 	}
 
@@ -292,6 +294,9 @@ func validateConfig(cfg Config) error {
 	}
 	if len(cfg.Providers) > 0 {
 		for _, p := range cfg.Providers {
+			if p.AuthType == "oauth" {
+				continue // OAuth providers don't need base_url or api_keys at config time
+			}
 			if strings.TrimSpace(p.BaseURL) == "" {
 				return fmt.Errorf("provider %q: base_url is required", p.Name)
 			}
@@ -967,16 +972,49 @@ func (a *App) proxySingleProvider(w http.ResponseWriter, r *http.Request, ctx co
 
 // proxyMultiProvider tries providers in priority order. When one provider's
 // keys are quota-exhausted, it falls through to the next provider's key pool.
+// OAuth providers use the ChatGPT Codex endpoint with auto-refreshed tokens.
 func (a *App) proxyMultiProvider(w http.ResponseWriter, r *http.Request, ctx context.Context, body []byte, style APIStyle) {
 	totalKeys := 0
 	for _, prov := range a.router.providers {
-		totalKeys += len(prov.Config.APIKeys)
+		if prov.IsOAuth() {
+			totalKeys++ // OAuth provider counts as one "key"
+		} else {
+			totalKeys += len(prov.Config.APIKeys)
+		}
 	}
 	for attempts := 0; attempts < totalKeys; attempts++ {
 		prov, keyIdx, key, ok := a.router.Current()
 		if !ok {
 			break
 		}
+		if prov.IsOAuth() {
+			token, err := prov.OAuth.AccessToken(ctx)
+			if err != nil {
+				log.Printf("oauth provider %q: %v", prov.Config.Name, err)
+				// Token expired/refresh failed — skip to next provider.
+				continue
+			}
+			// OAuth providers go to the ChatGPT Codex endpoint.
+			resp, reqErr := a.doUpstream(ctx, r, body, openAICodexAPIEndpoint, token, style)
+			if reqErr != nil {
+				http.Error(w, reqErr.Error(), http.StatusBadGateway)
+				return
+			}
+			if resp.StatusCode == http.StatusTooManyRequests && isQuota429(resp) {
+				_ = resp.Body.Close()
+				// OAuth token is quota-exhausted — mark it so the router
+				// falls through to the next provider.
+				if err := prov.OAuth.SaveTokens(&OAuthTokens{Provider: prov.Config.Name}); err != nil {
+					log.Printf("oauth: failed to clear tokens: %v", err)
+				}
+				log.Printf("provider %q: oauth quota exhausted, falling through", prov.Config.Name)
+				continue
+			}
+			// Non-429 — token is fine, let the response through.
+			copyResponse(w, resp)
+			return
+		}
+
 		resp, reqErr := a.doUpstream(ctx, r, body, prov.Config.BaseURL, key, style)
 		if reqErr != nil {
 			http.Error(w, reqErr.Error(), http.StatusBadGateway)
@@ -996,7 +1034,7 @@ func (a *App) proxyMultiProvider(w http.ResponseWriter, r *http.Request, ctx con
 	}
 	if a.router.AllExhausted() {
 		for _, prov := range a.router.providers {
-			if prov.Keys.AllExhausted() {
+			if !prov.IsOAuth() && prov.Keys.AllExhausted() {
 				a.sender.NotifyAllExhausted(prov.Keys.Status())
 			}
 		}
@@ -1239,6 +1277,23 @@ func main() {
 			log.Fatal(err)
 		}
 		log.Println(safeConfigSummary(cfg))
+		return
+	}
+	if len(os.Args) > 2 && os.Args[1] == "oauth-login" {
+		providerName := os.Args[2]
+		fmt.Printf("Starting ChatGPT OAuth login for provider %q...\n", providerName)
+		tokens, err := StartOAuthLogin(providerName)
+		if err != nil {
+			log.Fatalf("oauth login failed: %v", err)
+		}
+		store, err := NewOAuthTokenStore(providerName)
+		if err != nil {
+			log.Fatalf("token store: %v", err)
+		}
+		if err := store.SaveTokens(tokens); err != nil {
+			log.Fatalf("save tokens: %v", err)
+		}
+		log.Printf("✅ OAuth login successful for %q — tokens saved to ~/.config/switchboard-go/%s-oauth.json", providerName, providerName)
 		return
 	}
 	cfg, err := loadConfig()
